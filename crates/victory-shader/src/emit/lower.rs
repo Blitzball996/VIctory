@@ -985,7 +985,7 @@ impl<'a> Lower<'a> {
             Input::MergedWaveInfo => {
                 // shortcut: only the wave index (bits 24-27) is set; the
                 // console's other bits (lane counts) are read by no program.
-                let f = self.mesh_thread();
+                let f = self.group_index();
                 let shift = self.s.m.i32(self.wave().trailing_zeros());
                 let w = self.s.m.bin(self.s.entry, Bin::LShr, f, shift);
                 let k24 = self.s.m.i32(24);
@@ -1646,14 +1646,17 @@ impl<'a> Lower<'a> {
 
     /// This lane's bit of the mask `lo`, `hi` (wave64).
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
-        let lane = self.s.op(
-            at,
-            "waveGetLaneIndex",
-            Attr::ReadOnly,
-            self.s.t.i32,
-            111,
-            &[],
-        );
+        let lane = if self.console_lanes {
+            self.s.flags |= flags::WAVE_OPS;
+            self.s.op(at, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[])
+        } else {
+            // Without cross-lane instructions the group uses ordinary DXIL
+            // thread IDs. Its flat index modulo the guest wave size is the
+            // corresponding guest lane, including on wave32-only hardware.
+            let flat = self.group_index();
+            let mask = self.s.m.i32(self.wave() - 1);
+            self.s.m.bin(at, Bin::And, flat, mask)
+        };
         let (k31, k32, one, z) = (
             self.s.m.i32(31),
             self.s.m.i32(32),
@@ -1946,7 +1949,7 @@ impl<'a> Lower<'a> {
         );
         self.s
             .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
-        let flat = self.mesh_thread();
+        let flat = self.group_index();
         let guard = (threads > mesh.max_primitives).then(|| self.s.m.cmp(e, pred::IULT, flat, p));
         let at = self.begin_guarded(guard);
         let z = self.s.m.i32(0);
@@ -1962,9 +1965,8 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Mesh: the thread's index in the group, which is its vertex and
-    /// primitive index.
-    fn mesh_thread(&mut self) -> V {
+    /// Flattened thread index in the compute or mesh group.
+    fn group_index(&mut self) -> V {
         if let Some(f) = self.flat {
             return f;
         }
@@ -1990,7 +1992,7 @@ impl<'a> Lower<'a> {
         if self.s.mesh.is_some() {
             // The console's lane: mesh code reads no other lanes, so host
             // waves need not match the console's.
-            let f = self.mesh_thread();
+            let f = self.group_index();
             let m = self.s.m.i32(self.wave() - 1);
             return self.s.m.bin(self.s.entry, Bin::And, f, m);
         }
@@ -4152,14 +4154,29 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_cndmask_b32" => {
-                let mask = match v.src.get(2) {
-                    Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
-                    _ => None,
+                let Some(&Operand::Scalar { code, .. }) = v.src.get(2) else {
+                    return Err("a select on an untracked mask");
                 };
-                let m = mask
-                    .and_then(|m| self.x.st.masks.get(&m).copied())
-                    .ok_or("a select on an untracked mask")?;
-                let cond = self.boolean(m, c)?;
+                let cond = if code == NULL {
+                    self.s.m.bool(false)
+                } else {
+                    let lo = inst.read(Reg::S(code)).ok_or("a missing select mask")?;
+                    let hi = if self.x.native.wave64 {
+                        Some(inst.read(Reg::S(code + 1)).ok_or("a missing high select mask")?)
+                    } else {
+                        None
+                    };
+                    if let Some(m) = self.x.st.mask_bits(lo, hi) {
+                        self.boolean(m, c)?
+                    } else if matches!(self.x.native.io, StageIo::Cs(_)) {
+                        // A scalar holding ordinary data can also be read as a lane mask.
+                        let lo = self.i32_of(lo)?;
+                        let hi = hi.map(|value| self.i32_of(value)).transpose()?;
+                        self.lane_bit(c, lo, hi)
+                    } else {
+                        return Err("a select on an untracked mask");
+                    }
+                };
                 if v.abs != 0 || v.neg != 0 {
                     let (a, bb) = (f(self, 0)?, f(self, 1)?);
                     let r = self.s.m.select(c, cond, bb, a);
@@ -6675,7 +6692,7 @@ impl<'a> Lower<'a> {
                 x,
             ];
             if mesh {
-                args.push(self.mesh_thread());
+                args.push(self.group_index());
             }
             let void = self.s.t.void;
             self.s.op(
@@ -6700,7 +6717,7 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let z = self.s.m.i32(0);
         let culled = self.s.m.cmp(c, pred::SLT, x, z);
-        let mut args = vec![self.mesh_thread()];
+        let mut args = vec![self.group_index()];
         for k in 0..3 {
             let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x3FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);

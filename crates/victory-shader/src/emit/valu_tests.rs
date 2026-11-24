@@ -82,10 +82,14 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
 
+    build_compute(&words, false, 1)
+}
+
+fn build_compute(words: &[u32], wave64: bool, threads: u32) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 8,
         layout: vec![
             RootParam {
@@ -117,7 +121,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
-            threads: [1, 1, 1],
+            threads: [threads, 1, 1],
         }),
         code,
     };
@@ -214,6 +218,44 @@ fn run_cases(
 
 fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
+}
+
+#[test]
+fn scalar_select_uses_the_bit_for_each_guest_lane() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let masks = [0xA501_0801u32, 0x1180_4022];
+    for wave64 in [false, true] {
+        let mut words = vec![s_mov_b32(5, 0x80)];
+        words.extend(s_load_dwordx4(8, 4));
+        words.push(0x3402_0082); // v_lshlrev_b32 v1, 2, v0: output byte offset
+        words.extend(vop3(0x101, 2, 0x80, 0x81, sgpr(0))); // choose zero or one from s[0:1]
+        let [store, args] = buffer_store_dword(2, 8, 0);
+        words.extend([store | (1 << 12), args | 1, S_ENDPGM]); // offen, address in v1
+        let shader = build_compute(&words, wave64, 128);
+        let mut constants = vec![0; shader.user_data_dwords() as usize];
+        for param in &shader.user_data {
+            if param.root == RootType::Constants {
+                constants[param.index as usize] = masks[param.dword as usize];
+            }
+        }
+        let mut ran = false;
+        for warp in [false, true] {
+            let Ok(host) = Host::new(warp) else { continue };
+            let (root, pso) = host.compute_pipeline(&shader).expect("select pipeline");
+            let result = host.dispatch(&root, &pso, &Dispatch {
+                roots: vec![(0, Root::Constants(constants.clone()))],
+                views: &[View::RawUav(128)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            }).expect("select dispatch");
+            for (thread, &value) in result[0].iter().enumerate() {
+                let lane = thread % if wave64 { 64 } else { 32 };
+                assert_eq!(value, masks[lane / 32] >> (lane % 32) & 1, "thread {thread}, wave64={wave64}, warp={warp}");
+            }
+            ran = true;
+        }
+        assert!(ran);
+    }
 }
 
 fn f16_to_f32(bits: u16) -> f32 {
