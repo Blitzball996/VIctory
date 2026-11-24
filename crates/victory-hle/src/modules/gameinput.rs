@@ -1,5 +1,5 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
+//! or a DualSense exposed through WinMM. With no pad, the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
@@ -1067,10 +1067,14 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
-/// Host input: XInput pads, the keyboard while our process has focus.
+/// Host input: gamepads and the keyboard while our process has focus.
 #[cfg(windows)]
 mod host {
     use std::time::{Duration, Instant};
+    use windows_sys::Win32::Media::Multimedia::{
+        JOY_RETURNBUTTONS, JOY_RETURNPOVCTS, JOY_RETURNR, JOY_RETURNU, JOY_RETURNV, JOY_RETURNX,
+        JOY_RETURNY, JOY_RETURNZ, JOYCAPSW, JOYINFOEX, joyGetDevCapsW, joyGetPosEx,
+    };
 
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -1130,10 +1134,90 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        dualsense: [bool; PADS],
+    }
+
+    fn is_dualsense(slot: usize) -> bool {
+        let mut caps = JOYCAPSW::default();
+        // SAFETY: caps is writable and its size is passed to WinMM.
+        let result = unsafe { joyGetDevCapsW(slot, &mut caps, size_of::<JOYCAPSW>() as u32) };
+        result == 0 && caps.wMid == 0x054c && caps.wPid == 0x0ce6
+    }
+
+    fn dualsense_state(slot: usize) -> Option<PadState> {
+        let mut state = JOYINFOEX {
+            dwSize: size_of::<JOYINFOEX>() as u32,
+            dwFlags: (JOY_RETURNX
+                | JOY_RETURNY
+                | JOY_RETURNZ
+                | JOY_RETURNR
+                | JOY_RETURNU
+                | JOY_RETURNV
+                | JOY_RETURNBUTTONS
+                | JOY_RETURNPOVCTS) as u32,
+            ..Default::default()
+        };
+        // SAFETY: state is writable with the size expected by WinMM.
+        let result = unsafe { joyGetPosEx(slot as u32, &mut state) };
+        (result == 0).then(|| convert_dualsense(&state))
+    }
+
+    fn convert_dualsense(state: &JOYINFOEX) -> PadState {
+        // Square, cross, circle, triangle, bumpers, digital L2/R2, Create,
+        // Options and stick clicks. The analog trigger axes carry L2/R2.
+        let mapping = [
+            X,
+            A,
+            B,
+            Y,
+            LEFT_SHOULDER,
+            RIGHT_SHOULDER,
+            0,
+            0,
+            VIEW,
+            MENU,
+            LEFT_STICK,
+            RIGHT_STICK,
+        ];
+        let dpad = [
+            UP,
+            UP | RIGHT,
+            RIGHT,
+            RIGHT | DOWN,
+            DOWN,
+            DOWN | LEFT,
+            LEFT,
+            LEFT | UP,
+        ];
+        let mut buttons = dpad
+            .get((state.dwPOV / 4500) as usize)
+            .copied()
+            .unwrap_or(0);
+        for (index, button) in mapping.into_iter().enumerate() {
+            if state.dwButtons & (1 << index) != 0 {
+                buttons |= button;
+            }
+        }
+        let axis = |v: u32| v as f32 / 65535.0;
+        let stick = |v| 2.0 * axis(v) - 1.0;
+        PadState {
+            buttons,
+            left_x: stick(state.dwXpos),
+            left_y: -stick(state.dwYpos),
+            right_x: stick(state.dwZpos),
+            right_y: -stick(state.dwRpos),
+            left_trigger: axis(state.dwUpos),
+            right_trigger: axis(state.dwVpos),
+        }
     }
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
+            if self.dualsense[slot] {
+                let state = dualsense_state(slot);
+                self.dualsense[slot] = state.is_some();
+                return state;
+            }
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1141,6 +1225,13 @@ mod host {
             // SAFETY: room for the state.
             if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
+                if is_dualsense(slot)
+                    && let Some(pad) = dualsense_state(slot)
+                {
+                    self.dualsense[slot] = true;
+                    tracing::info!(slot, "DualSense connected through WinMM");
+                    return Some(pad);
+                }
                 return None;
             }
             self.empty_until[slot] = None;
@@ -1175,6 +1266,9 @@ mod host {
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+            if self.dualsense[slot] {
+                return;
+            }
             let speeds = XINPUT_VIBRATION {
                 wLeftMotorSpeed: low,
                 wRightMotorSpeed: high,
@@ -1231,6 +1325,36 @@ mod host {
             GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
             process == GetCurrentProcessId()
         }
+    }
+
+    #[test]
+    fn dualsense_maps_face_buttons_hat_and_analog_axes() {
+        let input = JOYINFOEX {
+            dwButtons: (1 << 1) | (1 << 9),
+            dwPOV: 31500,
+            dwXpos: 0,
+            dwYpos: 65535,
+            dwZpos: 65535,
+            dwRpos: 0,
+            dwUpos: 65535,
+            dwVpos: 0,
+            ..Default::default()
+        };
+        let pad = convert_dualsense(&input);
+        assert_eq!(pad.buttons, A | MENU | UP | LEFT);
+        assert_eq!(
+            (pad.left_x, pad.left_y, pad.right_x, pad.right_y),
+            (-1.0, -1.0, 1.0, 1.0)
+        );
+        assert_eq!((pad.left_trigger, pad.right_trigger), (1.0, 0.0));
+        assert_eq!(
+            convert_dualsense(&JOYINFOEX {
+                dwPOV: 65535,
+                ..input
+            })
+            .buttons,
+            A | MENU
+        );
     }
 
     #[test]
